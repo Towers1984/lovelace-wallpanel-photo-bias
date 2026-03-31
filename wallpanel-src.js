@@ -69,6 +69,14 @@ const defaultConfig = {
 	media_list_update_interval: 3600,
 	media_list_max_size: 500,
 	media_order: "random", // sorted / random
+	// ── Recency Bias ────────────────────────────────────────────────────────────────────
+	// Set recent_media_days > 0 to enable.
+	// recent_media_percent % of slots fill from photos within that many days.
+	// Remainder comes from older photos.
+	// Date sources: 1) Immich fileCreatedAt  2) YYYYMMDD_ filename prefix
+	// ──────────────────────────────────────────────────────────────────────
+	recent_media_days: 0,
+	recent_media_percent: 70,
 	exclude_filenames: [], // Excluded filenames (regex)
 	exclude_media_types: [], // Exclude media types (image / video)
 	exclude_media_orientation: "", // Exclude media items with this orientation (landscape / portrait / auto)
@@ -2640,6 +2648,36 @@ function initWallpanel() {
 			});
 		}
 
+		applyRecencyBias(mediaList) {
+			const recentDays    = Number(config.recent_media_days);
+			const recentPercent = Number(config.recent_media_percent);
+			if (!recentDays || isNaN(recentPercent) || recentPercent <= 0 || recentPercent >= 100) return mediaList;
+			const cutoffMs = Date.now() - recentDays * 86400000;
+			const UNKNOWN_RE = /^unknown_\d+_/i;
+			const DATE_PREFIX_RE = /(\d{4})(\d{2})(\d{2})_/;
+			function getTimestamp(item) {
+				if (item && typeof item === "object" && item.fileCreatedAt) {
+					const ts = new Date(item.fileCreatedAt).getTime(); return isNaN(ts) ? null : ts;
+				}
+				const url = (typeof item === "string") ? item : (item && item.url) ? item.url : null;
+				if (!url) return null;
+				const filename = url.split("/").pop().split("?")[0];
+				if (UNKNOWN_RE.test(filename)) return null;
+				const m = DATE_PREFIX_RE.exec(filename);
+				if (m) { const ts = new Date(parseInt(m[1],10), parseInt(m[2],10)-1, parseInt(m[3],10)).getTime(); return isNaN(ts) ? null : ts; }
+				return null;
+			}
+			const recent = [], older = [];
+			for (const item of mediaList) { const ts = getTimestamp(item); if (ts !== null && ts >= cutoffMs) recent.push(item); else older.push(item); }
+			if (recent.length === 0) { logger.warn(`recency bias: no recent items found (${mediaList.length} checked). Returning unchanged.`); return mediaList; }
+			if (older.length === 0) { logger.warn(`recency bias: all items are recent. Returning unchanged.`); return mediaList; }
+			const total = mediaList.length, recentCount = Math.max(1, Math.round(total * recentPercent / 100)), olderCount = total - recentCount;
+			function sample(arr, n) { const s = shuffleArray(arr), r = []; for (let i = 0; i < n; i++) r.push(s[i % s.length]); return r; }
+			const biased = [...sample(recent, recentCount), ...sample(older, olderCount)];
+			logger.info(`recency bias: ${recentCount} recent (pool=${recent.length}) + ${olderCount} older (pool=${older.length}) = ${biased.length}`);
+			return biased;
+		}
+
 		async updateMediaList(callback = null, force = false, retryCount = 0) {
 			if (!config.image_url) return;
 			if (this.updatingMediaList) return;
@@ -2750,6 +2788,8 @@ function initWallpanel() {
 
 			try {
 				let urls = await wp.findMedias(mediaContentId);
+				// Apply recency bias (uses YYYYMMDD_ prefix from rename_photos.py)
+				urls = wp.applyRecencyBias(urls);
 				if (config.media_order == "random") {
 					urls = shuffleArray(urls);
 				} else {
@@ -2960,6 +3000,12 @@ function initWallpanel() {
 				if (urls.length == 0) {
 					const msg = "No matching media assets found";
 					logger.error(msg);
+				}
+				// Apply recency bias using Immich fileCreatedAt metadata.
+				if (Number(config.recent_media_days) > 0) {
+					const itemsWithDates = urls.map((url) => ({ url, fileCreatedAt: (mediaInfo[url] && mediaInfo[url].fileCreatedAt) || null }));
+					const biasedItems = wp.applyRecencyBias(itemsWithDates);
+					urls = biasedItems.map((item) => item.url);
 				}
 				if (config.media_order == "random") {
 					urls = shuffleArray(urls);
