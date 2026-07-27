@@ -77,6 +77,10 @@ const defaultConfig = {
 	// ──────────────────────────────────────────────────────────────────────
 	recent_media_days: 0,
 	recent_media_percent: 70,
+	// Max time (seconds) to wait for a media element to become loadable/playable
+	// before giving up and advancing to the next item. Protects against a
+	// slow-to-buffer or corrupt video/image hanging the carousel forever.
+	media_load_timeout: 8,
 	exclude_filenames: [], // Excluded filenames (regex)
 	exclude_media_types: [], // Exclude media types (image / video)
 	exclude_media_orientation: "", // Exclude media items with this orientation (landscape / portrait / auto)
@@ -673,6 +677,33 @@ class CameraMotionDetection {
 			this._elementsAppended = false;
 		}
 	}
+}
+
+// Wraps a listener-based async operation (setup registers resolve/reject
+// listeners and returns a cleanup fn) with a hard timeout. Guarantees
+// cleanup runs whether the operation or the timeout wins, so a slow/hung
+// media element doesn't leak stale listeners onto elements that get reused.
+function raceWithTimeout(setup, ms, timeoutMessage) {
+	return new Promise((resolve, reject) => {
+		let done = false;
+		const timer = setTimeout(() => {
+			if (done) return;
+			done = true;
+			cleanup();
+			reject(new Error(timeoutMessage));
+		}, ms);
+		const finish = (fn, arg) => {
+			if (done) return;
+			done = true;
+			clearTimeout(timer);
+			cleanup();
+			fn(arg);
+		};
+		const cleanup = setup(
+			(value) => finish(resolve, value),
+			(err) => finish(reject, err)
+		);
+	});
 }
 
 function shuffleArray(array) {
@@ -3225,25 +3256,20 @@ function initWallpanel() {
 					throw new Error(`Unsupported element tag "${elem.tagName}"`);
 				}
 
-				const promise = new Promise((resolve, reject) => {
-					const cleanup = () => {
-						elem.onerror = null;
-						elem.removeEventListener(loadEventName, onLoad);
-					};
-
-					const onLoad = () => {
-						cleanup();
-						resolve();
-					};
-
-					const onError = () => {
-						cleanup();
-						reject(new Error(`Failed to load ${elem.tagName} "${url}"`));
-					};
-
-					elem.addEventListener(loadEventName, onLoad);
-					elem.onerror = onError;
-				});
+				const promise = raceWithTimeout(
+					(resolve, reject) => {
+						const onLoad = () => resolve();
+						const onError = () => reject(new Error(`Failed to load ${elem.tagName} "${url}"`));
+						elem.addEventListener(loadEventName, onLoad);
+						elem.onerror = onError;
+						return () => {
+							elem.onerror = null;
+							elem.removeEventListener(loadEventName, onLoad);
+						};
+					},
+					config.media_load_timeout * 1000,
+					`Timed out loading ${elem.tagName} "${url}" after ${config.media_load_timeout}s`
+				);
 				if (useFetch) {
 					if (config.stream_load_media) {
 						fetch(url, { headers: headers })
@@ -3549,25 +3575,21 @@ function initWallpanel() {
 
 					const isVideo = element.tagName.toLowerCase() === "video";
 
-					if (isVideo) {
-						await new Promise((resolve, reject) => {
-							if (element.readyState >= element.HAVE_ENOUGH_DATA) {
-								resolve();
-							} else {
-								const onCanPlay = () => {
-									element.removeEventListener("canplay", onCanPlay);
-									element.removeEventListener("error", onError);
-									resolve();
-								};
-								const onError = () => {
-									element.removeEventListener("canplay", onCanPlay);
-									element.removeEventListener("error", onError);
-									reject(new Error("Video failed to load"));
-								};
+					if (isVideo && element.readyState < element.HAVE_ENOUGH_DATA) {
+						await raceWithTimeout(
+							(resolve, reject) => {
+								const onCanPlay = () => resolve();
+								const onError = () => reject(new Error("Video failed to load"));
 								element.addEventListener("canplay", onCanPlay);
 								element.addEventListener("error", onError);
-							}
-						});
+								return () => {
+									element.removeEventListener("canplay", onCanPlay);
+									element.removeEventListener("error", onError);
+								};
+							},
+							config.media_load_timeout * 1000,
+							`Timed out waiting for video "${element.mediaUrl}" to become playable after ${config.media_load_timeout}s`
+						);
 					}
 					if (config.image_background === "image") {
 						this.loadBackgroundImage(element);
@@ -4054,7 +4076,11 @@ function initWallpanel() {
 				this.screensaverOverlay.style.background = "#000000";
 			} else if (config.show_images) {
 				if (now - this.lastMediaUpdate >= config.display_time * 1000) {
-					this.switchActiveMedia("display_time_elapsed");
+					if (this.updatingMedia) {
+						logger.debug("Skipping display_time_elapsed switch — already updating media");
+					} else {
+						this.switchActiveMedia("display_time_elapsed");
+					}
 				}
 				if (now - this.lastMediaListUpdate >= config.media_list_update_interval * 1000) {
 					this.updateMediaList(null, true);
